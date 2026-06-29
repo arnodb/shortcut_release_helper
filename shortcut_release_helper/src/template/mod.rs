@@ -1,10 +1,9 @@
 mod utils;
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::LazyLock};
 
 use anyhow::Result;
 use chrono::offset::Utc;
-use lazy_static::lazy_static;
 use minijinja::{
     value::{Value, ValueKind},
     Environment, ErrorKind, State,
@@ -20,6 +19,11 @@ pub struct FileTemplate<'a> {
 }
 
 const TEMPLATE_NAME: &str = "main";
+
+static MARKDOWN_ESCAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r##"([!"#$%&'()*+,-./:;<=>?@\[\]^_`{|}~\\])"##)
+        .expect("Markdown escape regex does not compile")
+});
 
 impl<'a> FileTemplate<'a> {
     pub fn new(template_content: &'a str) -> Result<Self> {
@@ -48,11 +52,6 @@ impl<'a> FileTemplate<'a> {
 
     /// Escape Markdown characters - useful for epic and story titles
     fn escape(_state: &State, v: Value) -> Result<Value, minijinja::Error> {
-        lazy_static! {
-            static ref MARKDOWN_ESCAPE_RE: Regex =
-                Regex::new(r##"([!"#$%&'()*+,-./:;<=>?@\[\]^_`{|}~\\])"##)
-                    .expect("Markdown escape regex does not compile");
-        };
         let v = match v.kind() {
             ValueKind::String => {
                 let string = v.as_str().expect("should be a string");
@@ -116,9 +115,9 @@ impl<'a> FileTemplate<'a> {
             let labels = epic_or_story.get_attr("labels")?;
             let mut labels_iter = SeqIterator::new(labels)?;
             let has_label = labels_iter.any(|label| {
-                label.get_attr("name").map_or(false, |name| {
-                    name.as_str().map_or(false, |name| name == label_name)
-                })
+                label
+                    .get_attr("name")
+                    .is_ok_and(|name| name.as_str() == Some(label_name))
             });
             if has_label {
                 matched.push(epic_or_story)
@@ -225,9 +224,9 @@ impl<'a> FileTemplate<'a> {
         let labels = epic_or_story.get_attr("labels")?;
         let mut labels_iter = SeqIterator::new(labels)?;
         let has_label = labels_iter.any(|label| {
-            label.get_attr("name").map_or(false, |name| {
-                name.as_str().map_or(false, |name| name == label_name)
-            })
+            label
+                .get_attr("name")
+                .is_ok_and(|name| name.as_str() == Some(label_name))
         });
         Ok(Value::from(has_label))
     }
