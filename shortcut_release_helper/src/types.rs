@@ -14,7 +14,7 @@ impl ShortcutApiKey {
 }
 
 /// Name of the repository, must be unique
-#[derive(Debug, PartialEq, Eq, Hash, Clone, AsRef, Deserialize, Display, Serialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, AsRef, Deserialize, Display, Serialize, From)]
 #[serde(transparent)]
 pub struct RepositoryName(String);
 

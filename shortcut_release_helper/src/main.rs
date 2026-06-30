@@ -37,12 +37,19 @@
 #[macro_use]
 extern crate derive_more;
 
+#[macro_use]
+extern crate static_assertions;
+
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env::{var, VarError},
     fs,
+    future::Future,
     path::PathBuf,
-    time::Instant,
+    pin::Pin,
+    sync::Arc,
+    thread::JoinHandle,
+    time::Duration,
 };
 
 use ansi_term::{
@@ -51,22 +58,26 @@ use ansi_term::{
 };
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use git::{Repository, UnreleasedCommits};
-use itertools::Itertools;
+use governor::{state::StreamRateLimitExt, Quota, RateLimiter};
+use quirky_binder_capnp::run_chain;
+use quirky_binder_support::prelude::ChainConfiguration;
+use scoped_tls::scoped_thread_local;
 use serde::Serialize;
-use shortcut::{ReleaseContent, StoryId};
+use shortcut::StoryId;
+use shortcut_client::apis::configuration as shortcut_cfg;
+use shortcut_client::apis::default_api as shortcut_api;
 use shortcut_client::models::{Epic, Story};
-use tracing::{debug, info};
+use tokio::{runtime::Handle, sync::Mutex};
+use tokio_stream::wrappers::ReceiverStream;
 use types::{RepoToCommits, RepoToHeadCommit};
 
 use crate::{
     config::AppConfig,
-    shortcut::{parse_commits, ShortcutClient, StoryLabelFilter},
-    types::{RepositoryConfiguration, RepositoryName, ShortcutApiKey},
+    shortcut::{run_streamed_tasks, ItemRetriever},
+    types::ShortcutApiKey,
 };
 
 mod config;
-mod git;
 mod shortcut;
 mod template;
 mod types;
@@ -101,39 +112,7 @@ struct Args {
     exclude_unparsed_commits: bool,
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(repo = %repo_name))]
-fn find_unreleased_commits(
-    repo_name: &RepositoryName,
-    repo_config: &RepositoryConfiguration,
-) -> Result<UnreleasedCommits> {
-    info!(
-        release_branch = %repo_config.release_branch,
-        next_branch = %repo_config.next_branch
-    );
-    debug!("Initializing repository");
-    let repo = {
-        let now = Instant::now();
-        let repo = Repository::new(repo_config)?;
-        debug!(
-            "Initialization done in {time}ms",
-            time = now.elapsed().as_millis()
-        );
-        repo
-    };
-    let commits = {
-        let now = Instant::now();
-        let commits = repo.find_unreleased_commits_and_head()?;
-        info!(
-            "Found {commit_count} unreleased commits in {time}ms",
-            commit_count = commits.unreleased_commits.len(),
-            time = now.elapsed().as_millis()
-        );
-        commits
-    };
-    Ok(commits)
-}
-
-fn print_summary(release: &ReleaseContent) {
+fn print_summary(release: &Release) {
     let header_style = Style::new().bold();
     println!(
         "{}: {}",
@@ -158,73 +137,164 @@ fn print_summary(release: &ReleaseContent) {
 }
 
 #[derive(Debug, Serialize)]
-pub struct Release<'a> {
-    pub name: Option<&'a str>,
-    pub version: Option<&'a str>,
-    pub description: Option<&'a str>,
+pub struct Release {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
     pub stories: Vec<Story>,
     pub epics: Vec<Epic>,
     pub unparsed_commits: RepoToCommits,
     pub next_heads: RepoToHeadCommit,
 }
 
+#[allow(dead_code)]
+#[allow(clippy::borrowed_box)]
+#[allow(clippy::module_inception)]
+mod chain {
+    include!(concat!(env!("OUT_DIR"), "/chain.rs"));
+}
+
+#[derive(Clone)]
+struct QuirkyShared {
+    args: Arc<Args>,
+    config: Arc<AppConfig>,
+    shortcut_story_retriever: Arc<DynItemRetriever<Story, i64>>,
+    shortcut_epic_retriever: Arc<DynItemRetriever<Epic, i64>>,
+    output: Arc<Mutex<Release>>,
+}
+
+scoped_thread_local!(static QUIRKY_SHARED: QuirkyShared);
+
+type DynItemRetriever<Item, Id> = ItemRetriever<
+    Item,
+    Id,
+    Box<
+        dyn Fn(Id) -> Pin<Box<dyn Future<Output = Result<Item, anyhow::Error>> + Send>>
+            + Send
+            + Sync,
+    >,
+    Pin<Box<dyn Future<Output = Result<Item, anyhow::Error>> + Send>>,
+>;
+
+fn custom_spawn<F, T>(f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T,
+    F: Send + 'static,
+    T: Send + 'static,
+{
+    let handle = Handle::current();
+    QUIRKY_SHARED.with(|shared| {
+        let shared = shared.clone();
+        std::thread::spawn(move || {
+            QUIRKY_SHARED.set(&shared, || {
+                let _guard = handle.enter();
+                f()
+            })
+        })
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    std::panic::set_hook(Box::new(|panic_info| {
+        dbg!(panic_info);
+        std::thread::sleep(Duration::from_mins(60));
+    }));
+
     let _ = dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    let args = Arc::new(Args::parse());
     let api_key = ShortcutApiKey::new(var("SHORTCUT_TOKEN").map_err(|err| match err {
         VarError::NotPresent => anyhow!("Missing SHORTCUT_TOKEN environment variable. Please provide it in a .env file or set it in your environment."),
         VarError::NotUnicode(_) => err.into(),
     })?);
-    let config = AppConfig::parse(&PathBuf::from("config.toml"))?;
+    let config = Arc::new(AppConfig::parse(&PathBuf::from("config.toml"))?);
     let template_content = fs::read_to_string(&config.template_file)?;
     let template = template::FileTemplate::new(&template_content)?;
-    let repo_names_and_heads_and_commits = futures::future::try_join_all(
-        config.repositories.into_iter().map(|(name, repo_config)| {
-            tokio::task::spawn_blocking::<_, Result<_>>(move || {
-                let commits = find_unreleased_commits(&name, &repo_config)?;
-                Ok((name, commits.next_head, commits.unreleased_commits))
-            })
-        }),
-    )
-    .await?;
-    let next_heads = repo_names_and_heads_and_commits
-        .iter()
-        .map(|repo_name_and_head_and_commit| {
-            let (repo_name, next_head, _commits) = repo_name_and_head_and_commit
-                .as_ref()
-                .map_err(|err| anyhow!("{:?}", err))?;
-            Ok((repo_name.clone(), next_head.clone()))
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
-    let repo_names_and_commits = repo_names_and_heads_and_commits
-        .into_iter()
-        .map_ok(|(repo_name, _next_head, commits)| (repo_name, commits))
-        .collect::<Result<HashMap<_, _>>>()?;
-    let exclude_story_ids = HashSet::from_iter(args.exclude_story_id.iter().copied());
-    let parsed_commits = parse_commits(repo_names_and_commits, &exclude_story_ids)?;
-    debug!("Got result {:?}", parsed_commits);
-    let shortcut_client = ShortcutClient::new(&api_key);
-    let release_content = shortcut_client
-        .get_release(
-            parsed_commits,
-            StoryLabelFilter::new(&args.exclude_story_label, &args.include_story_label),
+
+    let mut chain_configuration = ChainConfiguration::new();
+
+    chain_configuration
+        .variables
+        .insert("shortcut_api_key".to_owned(), api_key.as_ref().clone());
+
+    let mut configuration = shortcut_cfg::Configuration::new();
+    configuration.api_key = Some(shortcut_cfg::ApiKey {
+        key: api_key.as_ref().clone(),
+        prefix: None,
+    });
+    let configuration = Arc::new(configuration);
+
+    let (shortcut_story_retriever, shortcut_epic_retriever, join_shortcut_retriever) = {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1000);
+        let story_retriever = ItemRetriever::new(
+            {
+                let configuration = configuration.clone();
+                Box::new(move |id| {
+                    let configuration = configuration.clone();
+                    Box::pin(async move {
+                        shortcut_api::get_story(&configuration, id)
+                            .await
+                            .map_err(|err| anyhow::anyhow!("{err}"))
+                    }) as Pin<Box<dyn Future<Output = _> + Send>>
+                })
+                    as Box<dyn Fn(_) -> Pin<Box<dyn Future<Output = _> + Send>> + Send + Sync>
+            },
+            sender.clone(),
+        );
+        let epic_retriever = ItemRetriever::new(
+            {
+                let configuration = configuration.clone();
+                Box::new(move |id| {
+                    let configuration = configuration.clone();
+                    Box::pin(async move {
+                        shortcut_api::get_epic(&configuration, id)
+                            .await
+                            .map_err(|err| anyhow::anyhow!("{err}"))
+                    }) as Pin<Box<dyn Future<Output = _> + Send>>
+                })
+                    as Box<dyn Fn(_) -> Pin<Box<dyn Future<Output = _> + Send>> + Send + Sync>
+            },
+            sender.clone(),
+        );
+        let join_retriever = Handle::current().spawn(async move {
+            let rate_limiter = RateLimiter::direct(Quota::per_minute(1000.try_into().unwrap()));
+            let task_stream = ReceiverStream::new(receiver).ratelimit_stream(&rate_limiter);
+            run_streamed_tasks(task_stream).await;
+        });
+        (
+            Arc::new(story_retriever),
+            Arc::new(epic_retriever),
+            join_retriever,
         )
-        .await?;
-    print_summary(&release_content);
-    let include_unparsed_commits = !args.exclude_unparsed_commits;
-    let release = Release {
-        name: args.name.as_deref(),
-        version: args.version.as_deref(),
-        description: args.description.as_deref(),
-        stories: release_content.stories,
-        epics: release_content.epics,
-        unparsed_commits: include_unparsed_commits
-            .then_some(release_content.unparsed_commits)
-            .unwrap_or_default(),
-        next_heads,
     };
+
+    let output = Arc::new(Mutex::new(Release {
+        name: args.name.clone(),
+        version: args.version.clone(),
+        description: args.description.clone(),
+        stories: Vec::new(),
+        epics: Vec::new(),
+        unparsed_commits: HashMap::new(),
+        next_heads: HashMap::new(),
+    }));
+
+    let (chain_status, join) = QUIRKY_SHARED.set(
+        &QuirkyShared {
+            args: args.clone(),
+            config,
+            shortcut_story_retriever,
+            shortcut_epic_retriever,
+            output: output.clone(),
+        },
+        || chain::main(chain_configuration).unwrap(),
+    );
+    run_chain(chain_status, || join.join_all()).unwrap();
+
+    join_shortcut_retriever.await.unwrap();
+
+    let release = Arc::into_inner(output).unwrap().into_inner();
+    print_summary(&release);
     template.render_to_file(&release, &args.output_file)?;
     Ok(())
 }

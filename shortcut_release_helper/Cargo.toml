@@ -11,18 +11,26 @@ anyhow = { version = "1", features = ["backtrace"] }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 derive_more = "0.99"
+derive-new = "0.7"
 dotenvy = "0.15"
+fallible-iterator = { version = "0.3" }
 futures = "0.3"
 git2 = "0.18"
 governor = "0.6"
-itertools = "0.11"
 minijinja = "1"
-lazy_static = "1"
-pin-project = "1"
+quirky_binder_capnp = { git = "https://github.com/arnodb/quirky_binder.git" }
+quirky_binder_support = { git = "https://github.com/arnodb/quirky_binder.git" }
 regex = "1"
+scoped-tls = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+static_assertions = { version = "1" }
 tokio = { version = "1", features = ["full", "tracing"] }
+tokio-stream = "0.1"
 toml = "0.8"
-tracing = "0.1"
 tracing-subscriber = "0.3"
+truc_runtime = { version = "0.4" }
+
+[build-dependencies]
+quirky_binder = { git = "https://github.com/arnodb/quirky_binder.git" }
+shortcut_client = { path = "../shortcut_client" }
+truc = { version = "0.4" }
