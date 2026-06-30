@@ -139,13 +139,12 @@ use quirky_binder::{
                     Ok((repo_name, id, message, story_id).into())
                 })
                 .chain(fallible_iterator::from_fn(move || {
-                    let mut unparsed_commits = HashMap::default();
-                    std::mem::swap(&mut unparsed_commits, &mut *unparsed_commits2.lock().map_err(|err| anyhow!("{err}"))?);
+                    let unparsed_commits = std::mem::take(&mut *unparsed_commits2.lock().map_err(|err| anyhow!("{err}"))?);
                     crate::QUIRKY_SHARED.with(|shared| {
                         let handle = tokio::runtime::Handle::current();
                         handle.block_on(async {
                             let mut release = shared.output.lock().await;
-                            std::mem::swap(&mut release.unparsed_commits, &mut unparsed_commits)
+                            release.unparsed_commits = unparsed_commits;
                         });
                     });
                     Ok(None)
@@ -252,7 +251,7 @@ use quirky_binder::{
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     let mut release = shared.output.lock().await;
-                    std::mem::swap(&mut release.stories, &mut stories)
+                    release.stories = stories;
                 });
             });
             Ok(())
@@ -313,7 +312,7 @@ use quirky_binder::{
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     let mut release = shared.output.lock().await;
-                    std::mem::swap(&mut release.epics, &mut epics)
+                    release.epics = epics;
                 });
             });
             Ok(())
